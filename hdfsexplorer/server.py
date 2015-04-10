@@ -47,7 +47,10 @@ def files_root():
 def files(path):
     params = _parse_and_validate_parameters(request)
 
-    files = list_files(path)
+    # files = list_files(path)
+    all_files = recursive_list_files(path)
+    files = parse_file_tree(all_files)
+
     if len(files) == 0:
         abort(404, 'No such folder %s' % path)
 
@@ -60,9 +63,6 @@ def files(path):
     else:
         base_dir = path
 
-    for file in files:
-        file['name'] = name_from_path(file['path'])
-
     files.extend(dir_details(base_dir))
 
     return render_dir(path, files, params, response)
@@ -71,7 +71,9 @@ def files(path):
 def render_file(file_details, params):
     # TODO identify type of file and change MIME type appropriately
     response.content_type = 'application/json'
-    return cat_hdfs_file(file_details['path'], params['lines'])
+    return cat_hdfs_file(file_details['path'],
+                         params['limit'],
+                         params['offset'])
 
 
 # TODO refactor so not so many args
@@ -97,25 +99,27 @@ def dir_details(base_dir):
         'is_dir': True,
     }
 
-    # parent_dir_details = {
-    #     'perms': None,  # eventually can fetch this from cache?
-    #     'replicas': '-',
-    #     'user': None,  # eventually can fetch this from cache?
-    #     'group': None,  # eventually can fetch this from cache?
-    #     'size': '0',
-    #     'mod_date': '2015-04-09',  # should fix this
-    #     'mod_time': '00:00',  # should fix this
-    #     'path': base_dir,
-    #     'name': '..',
-    #     'is_dir': True,
-    # }
+    if base_dir == '/':
+        return [base_dir_details]
 
-    # return [base_dir_details, parent_dir_details]
-    return [base_dir_details]
+    parent_dir = base_dir[:base_dir.rfind('/')]
+    if not parent_dir:
+        parent_dir = '/'
 
+    parent_dir_details = {
+        'perms': None,  # eventually can fetch this from cache?
+        'replicas': '-',
+        'user': None,  # eventually can fetch this from cache?
+        'group': None,  # eventually can fetch this from cache?
+        'size': '0',
+        'mod_date': '2015-04-09',  # should fix this
+        'mod_time': '00:00',  # should fix this
+        'path': parent_dir,
+        'name': '..',
+        'is_dir': True,
+    }
 
-def name_from_path(path):
-    return path[path.rfind('/') + 1:]
+    return [base_dir_details, parent_dir_details]
 
 
 def list_files(path):
@@ -126,12 +130,51 @@ def list_files(path):
     return map(parse_file_details, lines)
 
 
+def recursive_list_files(path):
+    ls = subprocess.Popen(['hadoop', 'fs', '-ls', '-R', path],
+                          stdout=subprocess.PIPE)
+
+    lines = [line for line in ls.stdout if relevant(path, line)]
+    return map(parse_file_details, lines)
+
+
+def parse_file_tree(files):
+    # yup, this is hideous
+    # TODO rewrite this whole method to be more efficient
+    children = []
+    for f in files:
+        for ff in files:
+            if f['path'] == ff['path']:
+                continue
+            if f['path'].startswith(ff['path']):
+                children.append(f['path'])
+                if 'children' not in ff:
+                    ff['children'] = [f]
+                else:
+                    ff['children'].append(f)
+
+    # iterate again, 'cause reasons
+    # (filtering out non-direct children
+    # e.g. given [a, a/b, a/b/c]
+    # we now have a -> a/b, a -> a/b/c, a/b -> a/b/c
+    # We want a-> a/b, a/b -> a/b/c )
+    top_level = []
+    for f in files:
+        if f['path'] not in children:
+            top_level.append(f)
+        if 'children' not in f:
+            continue
+        f['children'] = [ch for ch in f['children']
+                         if ch['path'].replace(f['path'], '').rfind('/') < 1]
+
+    return top_level
+
+
 def relevant(path, line):
     pattern = path.replace('*', '[^/]*')
     return re.search(pattern, line)
 
 
-# TODO rename this
 def parse_file_details(line):
     parts = line.split()
     details = {
@@ -142,33 +185,33 @@ def parse_file_details(line):
         'size': parts[4],
         'mod_date': parts[5],
         'mod_time': parts[6],
-        'path': parts[7]
+        'path': parts[7],
+        'name': name_from_path(parts[7])
     }
     details['is_dir'] = details['replicas'] == '-'
 
     return details
 
 
-def cat_hdfs_file(filename, num_lines):
+def name_from_path(path):
+    return path[path.rfind('/') + 1:]
+
+
+def cat_hdfs_file(filename, limit, offset):
+    # This is quite 'novel'. Can it be done better?
     cat = subprocess.Popen(['hadoop', 'fs', '-cat', filename],
                            stdout=subprocess.PIPE)
-    count = 0
-    output = []
-    for line in cat.stdout:
-        if count <= num_lines:
-            count += 1
-            output.append(line)
 
-    # hack to trim hadoop warning from output
-    return output[1:]
+    # 1 extra line to account for log warning. THIS IS A HACK
+    head = subprocess.Popen(['head', '-n' + str(limit + offset + 1)],
+                            stdin=cat.stdout,
+                            stdout=subprocess.PIPE)
 
-# TODO re-add support for JSON by looking at Headers
-# @app.get(API_VERSION + '/files<path:path>.json')
-# def files_json(path):
-#     response.content_type = 'application/json'
-#     return json.dumps({
-#         'files': _files_for_path(path)
-#     })
+    tail = subprocess.Popen(['tail', '-n' + str(limit)],
+                            stdin=head.stdout,
+                            stdout=subprocess.PIPE)
+
+    return tail.stdout
 
 
 @app.get(API_VERSION + '/_ping')
@@ -189,17 +232,6 @@ def _ping():
 
 def _parse_and_validate_parameters(request):
     parameters = {}
-
-    # path parameter
-    try:
-        lines = int(request.query.lines or DEFAULT_LINES)
-    except:
-        abort(400, 'Invalid lines parameter')
-    if lines <= 0:
-        abort(400, 'Invalid parameter: lines must be > 0')
-    if lines > MAX_LINES:
-        abort(400, 'Limit exceeds maximum of %d' % MAX_LINES)
-    parameters['lines'] = lines
 
     # limit parameter
     try:
